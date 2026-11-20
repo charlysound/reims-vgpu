@@ -1,0 +1,158 @@
+diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
+index 93b58d12a5239b77f99fb517dada4e590c861383..74f3bfef10fc4cff6ecbcc9eeaddc64e37f11b8e 100644
+--- a/crates/reims-vgpu-window/features.md
++++ b/crates/reims-vgpu-window/features.md
+@@ -478,3 +478,9 @@ captured through SDL's resizable flag. `manual`
+   pointer crosses the window edges freely and host shortcuts remain available.
+   The title says "souris libre".
+   `test: native::linux::input::seamless_clicks_and_drags_never_capture`, `manual`
++
++- A seamless Linux drag across adjacent Reims windows keeps the source's
++  accepted button press, but forwards destination-local coordinates to that
++  display, including the final release. A release outside all Reims windows
++  retains the ordinary source-window behavior.
++  `test: native::linux::input::seamless_drag_keeps_button_for_another_display_then_releases`, `manual`
+diff --git a/crates/reims-vgpu-window/src/native/linux/input.rs b/crates/reims-vgpu-window/src/native/linux/input.rs
+index b96f2dc8ca77b653a56899d2c0732f09fb091395..2162f3dc6783b94d6b9e2b9dc4a0383595b66d0a 100644
+--- a/crates/reims-vgpu-window/src/native/linux/input.rs
++++ b/crates/reims-vgpu-window/src/native/linux/input.rs
+@@ -215,6 +215,11 @@ impl Input {
+         }
+     }
+ 
++    /// Whether a forwarded button is still down, including outside its source window.
++    pub(crate) fn has_buttons(&self) -> bool {
++        self.buttons != 0
++    }
++
+     /// Button `bit` went down at `timestamp` (SDL's event clock).
+     pub(crate) fn button_down(&mut self, bit: u32, timestamp: u64, at: &At) -> Reaction {
+         let (Some(point), Some(mode)) = (at.point, guest_mode(at)) else {
+@@ -457,6 +462,24 @@ mod tests {
+         assert!(!input.title_suffix().contains("capture"));
+     }
+ 
++    /// The click that focuses the window is not sent, but captures; the next one is sent
++    #[test]
++    fn seamless_drag_keeps_button_for_another_display_then_releases() {
++        let mut input = Input::seamless();
++        input.focus_gained(0);
++        input.button_down(BUTTON_LEFT, 1_000_000_000, &at((80.0, 10.0)));
++        input.take();
++        assert!(input.has_buttons());
++        // The event dispatcher supplies the destination's local geometry while
++        // the source continues owning the accepted press.
++        input.moved(&at((5.0, 10.0)));
++        assert_eq!(input.take(), vec![pointer(10, 20, BUTTON_LEFT)]);
++        input.button_up(BUTTON_LEFT, &at((6.0, 10.0)));
++        assert_eq!(input.take(), vec![pointer(12, 20, 0)]);
++        assert!(!input.has_buttons());
++        assert!(!input.is_captured());
++    }
++
+     /// The click that focuses the window is not sent, but captures; the next one is sent
+     #[test]
+     fn the_click_that_focuses_the_window_is_not_sent() {
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index 24282265db2aacf9fce04711fd22e780dcc81eb3..b82fd1615bde24b1ed04eadee68b3ea56a2325de 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -241,6 +241,83 @@ fn at(shell: &Shell, point: (f32, f32)) -> At {
+ 
+ /// An input event of type `kind` for the window: the pointer, a button, the wheel or a key, to
+ /// the window's input. Whether capture changed.
++///
++/// A seamless drag retains the source's button ownership, but uses the destination
++/// window's coordinates and callback when SDL's automatic drag capture names the source.
++pub(crate) fn route_seamless_drag(id: u64, kind: u32, event: &SDL_Event) -> bool {
++    let point = if kind == SDL_EVENT_MOUSE_MOTION.0 {
++        // SAFETY: the event type selects the motion member.
++        unsafe { (event.motion.x, event.motion.y) }
++    } else if kind == SDL_EVENT_MOUSE_BUTTON_UP.0 {
++        // SAFETY: the event type selects the button member.
++        unsafe { (event.button.x, event.button.y) }
++    } else {
++        return false;
++    };
++    let source =
++        shell::each_open(|s| (s.window.id() == id && s.input.0.has_buttons()).then_some(s.sdl));
++    let Some(&source) = source.first() else {
++        return false;
++    };
++    let (mut sx, mut sy) = (0, 0);
++    // SAFETY: all window access is on SDL's owning thread.
++    if !unsafe { SDL_GetWindowPosition(source, &mut sx, &mut sy) } {
++        return false;
++    }
++    let global = (
++        f64::from(sx) + f64::from(point.0),
++        f64::from(sy) + f64::from(point.1),
++    );
++    let targets = shell::each_open(|s| {
++        if s.closed {
++            return None;
++        }
++        let (mut x, mut y, mut w, mut h) = (0, 0, 0, 0);
++        // SAFETY: these are live SDL windows on SDL's thread.
++        unsafe {
++            if (SDL_GetWindowFlags(s.sdl) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)).0 != 0
++                || !SDL_GetWindowPosition(s.sdl, &mut x, &mut y)
++                || !SDL_GetWindowSize(s.sdl, &mut w, &mut h)
++            {
++                return None;
++            }
++        }
++        let local = (global.0 - f64::from(x), global.1 - f64::from(y));
++        if local.0 < 0.0 || local.1 < 0.0 || local.0 >= f64::from(w) || local.1 >= f64::from(h) {
++            return None;
++        }
++        Some((
++            s.window.clone(),
++            At {
++                point: Some(local),
++                image: s.layout.image,
++                guest: s.window.mode(),
++            },
++        ))
++    });
++    // Inside the source, preserve ordinary capture behavior even if windows overlap.
++    if targets.iter().any(|(w, _)| w.id() == id) {
++        return false;
++    }
++    let Some((target, at)) = targets.first() else {
++        return false;
++    };
++    shell::with_shell(id, |source| {
++        if kind == SDL_EVENT_MOUSE_MOTION.0 {
++            source.input.0.moved(at);
++        } else {
++            // SAFETY: the remaining kind is button-up.
++            source
++                .input
++                .0
++                .button_up(input::button_bit(unsafe { event.button.button }), at);
++        }
++        source.input.flush(target);
++    });
++    true
++}
++
++/// Handles one ordinary window input event.
+ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bool {
+     match kind {
+         k if k == SDL_EVENT_MOUSE_MOTION.0 => {
+diff --git a/crates/reims-vgpu-window/src/sdl/shell.rs b/crates/reims-vgpu-window/src/sdl/shell.rs
+index 3df17e2df86e4e68bbfe6ea2f4b109fde307f0de..9ceab9312aa29913d0dbdbfc594e079f941667dc 100644
+--- a/crates/reims-vgpu-window/src/sdl/shell.rs
++++ b/crates/reims-vgpu-window/src/sdl/shell.rs
+@@ -308,6 +308,10 @@ pub(crate) fn event(event: &SDL_Event) {
+     let Some(id) = window_of(sdl_id) else {
+         return;
+     };
++    #[cfg(target_os = "linux")]
++    if crate::env::settings().seamless_input && os::route_seamless_drag(id, kind, event) {
++        return;
++    }
+     with_shell(id, |shell| {
+         if !shell.closed {
+             shell.event(kind, event);

@@ -1,0 +1,212 @@
+diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
+index 74f3bfef10fc4cff6ecbcc9eeaddc64e37f11b8e..65dfa15ec54ac0e6120fffdaf6aa4e52ca41a4f3 100644
+--- a/crates/reims-vgpu-window/features.md
++++ b/crates/reims-vgpu-window/features.md
+@@ -481,6 +481,6 @@ captured through SDL's resizable flag. `manual`
+ 
+ - A seamless Linux drag across adjacent Reims windows keeps the source's
+   accepted button press, but forwards destination-local coordinates to that
+-  display, including the final release. A release outside all Reims windows
+-  retains the ordinary source-window behavior.
++  display, including the final release. Outside the Reims windows, coordinates
++  clamp to the last display visited during the drag.
+   `test: native::linux::input::seamless_drag_keeps_button_for_another_display_then_releases`, `manual`
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index 9a325b427370482e92f240b78fabac9335929e2d..86a1af497ce9e2652c19749960a2a864ada64417 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -64,6 +64,8 @@ pub(crate) struct State {
+     /// The screen it opened on: SDL's answer to which screen a window is on is not used (the
+     /// module doc).
+     display: SDL_DisplayID,
++    /// The last destination reached by a drag whose button this window owns.
++    drag_target: Option<u64>,
+ }
+ 
+ /// A window's input: SDL's events, queued until the shell sends them (`super::input`).
+@@ -111,9 +113,9 @@ impl Input {
+     /// ([`Window::pointer_sent`]).
+     pub(crate) fn flush(&mut self, window: &Window) {
+         window.send_each(self.0.take(), |callbacks, event| {
+-            if let input::ToHost::Pointer { at, mode, .. } = event {
+-                select_tablet_display(window.port(), at, mode);
+-            }
++            let Some(event) = synchronized_pointer_event(window.port(), event) else {
++                return;
++            };
+             if matches!(event, input::ToHost::Pointer { .. }) {
+                 window.pointer_sent();
+             }
+@@ -122,10 +124,43 @@ impl Input {
+     }
+ }
+ 
++/// Keeps a failed switch from sending new-screen coordinates to the old screen.
++/// A release still reaches the guest at the last accepted point, so a helper
++/// failure cannot leave a mouse button down.
++fn synchronized_pointer_event(port: u64, event: input::ToHost) -> Option<input::ToHost> {
++    use std::cell::Cell;
++
++    thread_local! {
++        static LAST_POINTER: Cell<Option<input::ToHost>> = const { Cell::new(None) };
++    }
++    let input::ToHost::Pointer { at, mode, buttons } = event else {
++        return Some(event);
++    };
++    let event = if select_tablet_display(port, at, mode) {
++        event
++    } else {
++        let input::ToHost::Pointer {
++            at,
++            mode,
++            buttons: previous_buttons,
++        } = LAST_POINTER.get()?
++        else {
++            return None;
++        };
++        let buttons = buttons & previous_buttons;
++        if buttons == previous_buttons {
++            return None;
++        }
++        input::ToHost::Pointer { at, mode, buttons }
++    };
++    LAST_POINTER.set(Some(event));
++    Some(event)
++}
++
+ // The guest's tablet coordinates are local to the screen containing its cursor.
+ // Serialize the warp with SDL's input stream. The guest must finish switching
+ // screens before QEMU sees coordinates relative to the new screen.
+-fn select_tablet_display(port: u64, at: (u16, u16), mode: (u16, u16)) {
++fn select_tablet_display(port: u64, at: (u16, u16), mode: (u16, u16)) -> bool {
+     use std::cell::Cell;
+     use std::io::{Read, Write};
+     use std::os::unix::net::UnixStream;
+@@ -137,20 +172,23 @@ fn select_tablet_display(port: u64, at: (u16, u16), mode: (u16, u16)) {
+     let Some(socket) = SOCKET
+         .get_or_init(|| std::env::var_os("REIMS_VGPU_TABLET_DISPLAY_SOCKET").map(PathBuf::from))
+     else {
+-        return;
++        return true;
+     };
+     thread_local! {
+         static SELECTED: Cell<Option<u64>> = const { Cell::new(None) };
+         static LAST_FAILURE: Cell<Option<u64>> = const { Cell::new(None) };
+     }
++    if SELECTED.get() == Some(port) {
++        return true;
++    }
+     // SAFETY: SDL is initialized on the calling UI thread.
+     let ticks = unsafe { SDL_GetTicks() };
+-    if SELECTED.get() == Some(port)
+-        || LAST_FAILURE
+-            .get()
+-            .is_some_and(|at| ticks.saturating_sub(at) < 250)
++    let primary_before_first_switch = SELECTED.get().is_none() && port == 0;
++    if LAST_FAILURE
++        .get()
++        .is_some_and(|at| ticks.saturating_sub(at) < 50)
+     {
+-        return;
++        return primary_before_first_switch;
+     }
+ 
+     let result = (|| -> std::io::Result<bool> {
+@@ -171,9 +209,10 @@ fn select_tablet_display(port: u64, at: (u16, u16), mode: (u16, u16)) {
+     if matches!(result, Ok(true)) {
+         SELECTED.set(Some(port));
+         LAST_FAILURE.set(None);
++        true
+     } else {
+-        SELECTED.set(None);
+         LAST_FAILURE.set(Some(ticks));
++        primary_before_first_switch
+     }
+ }
+ 
+@@ -250,7 +289,10 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) ->
+         } else {
+             input::Input::new()
+         }),
+-        state: State { display },
++        state: State {
++            display,
++            drag_target: None,
++        },
+     })
+ }
+ 
+@@ -312,9 +354,16 @@ pub(crate) fn route_seamless_drag(id: u64, kind: u32, event: &SDL_Event) -> bool
+     } else {
+         return false;
+     };
+-    let source =
+-        shell::each_open(|s| (s.window.id() == id && s.input.0.has_buttons()).then_some(s.sdl));
+-    let Some(&source) = source.first() else {
++    let source = shell::with_shell(id, |s| {
++        if s.input.0.has_buttons() {
++            Some((s.sdl, s.os.drag_target))
++        } else {
++            s.os.drag_target = None;
++            None
++        }
++    })
++    .flatten();
++    let Some((source, previous_target)) = source else {
+         return false;
+     };
+     let (mut sx, mut sy) = (0, 0);
+@@ -341,10 +390,13 @@ pub(crate) fn route_seamless_drag(id: u64, kind: u32, event: &SDL_Event) -> bool
+             }
+         }
+         let local = (global.0 - f64::from(x), global.1 - f64::from(y));
+-        if local.0 < 0.0 || local.1 < 0.0 || local.0 >= f64::from(w) || local.1 >= f64::from(h) {
++        let inside =
++            local.0 >= 0.0 && local.1 >= 0.0 && local.0 < f64::from(w) && local.1 < f64::from(h);
++        if !inside && previous_target != Some(s.window.id()) {
+             return None;
+         }
+         Some((
++            inside,
+             s.window.clone(),
+             At {
+                 point: Some(local),
+@@ -353,11 +405,17 @@ pub(crate) fn route_seamless_drag(id: u64, kind: u32, event: &SDL_Event) -> bool
+             },
+         ))
+     });
+-    // Inside the source, preserve ordinary capture behavior even if windows overlap.
+-    if targets.iter().any(|(w, _)| w.id() == id) {
++    // The source wins an overlap. Outside all windows, keep the last destination
++    // and clamp to its image, including when the drag ends on the host desktop.
++    if targets.iter().any(|(inside, w, _)| *inside && w.id() == id) {
++        shell::with_shell(id, |s| s.os.drag_target = None);
+         return false;
+     }
+-    let Some((target, at)) = targets.first() else {
++    let Some((_, target, at)) = targets
++        .iter()
++        .find(|(inside, _, _)| *inside)
++        .or_else(|| targets.first())
++    else {
+         return false;
+     };
+     shell::with_shell(id, |source| {
+@@ -370,6 +428,7 @@ pub(crate) fn route_seamless_drag(id: u64, kind: u32, event: &SDL_Event) -> bool
+                 .0
+                 .button_up(input::button_bit(unsafe { event.button.button }), at);
+         }
++        source.os.drag_target = source.input.0.has_buttons().then(|| target.id());
+         source.input.flush(target);
+     });
+     true
+@@ -392,6 +451,9 @@ pub(crate) fn input_event(shell: &mut Shell, kind: u32, event: &SDL_Event) -> bo
+             let at = at(shell, (b.x, b.y));
+             let bit = input::button_bit(b.button);
+             if b.down {
++                if !shell.input.0.has_buttons() {
++                    shell.os.drag_target = None;
++                }
+                 shell
+                     .input
+                     .0

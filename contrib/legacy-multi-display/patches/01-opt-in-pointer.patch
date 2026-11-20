@@ -1,0 +1,163 @@
+diff --git a/crates/reims-vgpu-window/features.md b/crates/reims-vgpu-window/features.md
+index 24a007d296fb15873b512d7780575b308d6d3bf6..93b58d12a5239b77f99fb517dada4e590c861383 100644
+--- a/crates/reims-vgpu-window/features.md
++++ b/crates/reims-vgpu-window/features.md
+@@ -472,3 +472,9 @@ captured through SDL's resizable flag. `manual`
+   wheel.
+ - Fn/Globe: QEMU's USB keyboard cannot carry it.
+ - HDR output.
++
++- On Linux, `REIMS_VGPU_WINDOW_SEAMLESS_INPUT=1` disables click-to-capture.
++  Absolute pointer movement, clicks and scrolling still reach the guest; the
++  pointer crosses the window edges freely and host shortcuts remain available.
++  The title says "souris libre".
++  `test: native::linux::input::seamless_clicks_and_drags_never_capture`, `manual`
+diff --git a/crates/reims-vgpu-window/src/env.rs b/crates/reims-vgpu-window/src/env.rs
+index dc87e6392fd37afffa1782061be116b63a301831..d25ea2f9f0edce9982efb26ac62d6d982a757fe0 100644
+--- a/crates/reims-vgpu-window/src/env.rs
++++ b/crates/reims-vgpu-window/src/env.rs
+@@ -17,6 +17,8 @@ use std::sync::OnceLock;
+ 
+ /// The borderless switch's variable.
+ pub const BORDERLESS_VAR: &str = "REIMS_VGPU_WINDOW_BORDERLESS";
++/// On Linux, let the pointer cross the window without click-to-capture.
++pub const SEAMLESS_INPUT_VAR: &str = "REIMS_VGPU_WINDOW_SEAMLESS_INPUT";
+ /// The screen list's variable.
+ pub const SCREENS_VAR: &str = "REIMS_VGPU_WINDOW_SCREENS";
+ /// The refresh rate's variable.
+@@ -32,6 +34,8 @@ const MAX_REFRESH_HZ: f64 = 1000.0;
+ pub struct Settings {
+     /// Borderless windows that fill their screens.
+     pub borderless: bool,
++    /// Linux input without pointer confinement or keyboard grab.
++    pub seamless_input: bool,
+     /// The host screen of each display, by port; empty when unset.
+     pub screens: Vec<usize>,
+     /// The refresh rate of the offered modes, in Hz, when set.
+@@ -63,6 +67,7 @@ pub fn parse_impl(value: Option<&str>) -> WindowImpl {
+ pub fn parse(borderless: Option<&str>, screens: Option<&str>, refresh: Option<&str>) -> Settings {
+     Settings {
+         borderless: borderless.is_some_and(parse_switch),
++        seamless_input: false,
+         screens: screens.and_then(parse_screens).unwrap_or_default(),
+         refresh_hz: refresh.and_then(parse_refresh),
+         window_impl: WindowImpl::AppKit,
+@@ -101,6 +106,7 @@ pub fn settings() -> &'static Settings {
+             (var(BORDERLESS_VAR), var(SCREENS_VAR), var(REFRESH_VAR));
+         Settings {
+             window_impl: parse_impl(var(IMPL_VAR).as_deref()),
++            seamless_input: var(SEAMLESS_INPUT_VAR).as_deref().is_some_and(parse_switch),
+             ..parse(
+                 borderless.as_deref(),
+                 screens.as_deref(),
+diff --git a/crates/reims-vgpu-window/src/native/linux/input.rs b/crates/reims-vgpu-window/src/native/linux/input.rs
+index 6f279cf012399f0748394751f70af6c64ca10a4a..b96f2dc8ca77b653a56899d2c0732f09fb091395 100644
+--- a/crates/reims-vgpu-window/src/native/linux/input.rs
++++ b/crates/reims-vgpu-window/src/native/linux/input.rs
+@@ -139,6 +139,8 @@ pub(crate) struct Input {
+     keys: KeyState,
+     /// Who gets the keyboard.
+     capture: Capture,
++    /// Send absolute pointer events without taking host input.
++    seamless: bool,
+     /// The `BUTTON_*` bits of the buttons the guest was told are down.
+     buttons: u32,
+     /// The pointer event last sent.
+@@ -157,6 +159,14 @@ impl Input {
+         Input::default()
+     }
+ 
++    /// Absolute pointer input that never captures the keyboard or pointer.
++    pub(crate) fn seamless() -> Input {
++        Input {
++            seamless: true,
++            ..Input::default()
++        }
++    }
++
+     /// Whether input, the keyboard and the pointer, is captured.
+     pub(crate) fn is_captured(&self) -> bool {
+         self.capture.is_captured()
+@@ -170,7 +180,9 @@ impl Input {
+ 
+     /// What the title ends with: the release chord while captured, that a click captures while not.
+     pub(crate) fn title_suffix(&self) -> &'static str {
+-        if self.is_captured() {
++        if self.seamless {
++            " — souris libre"
++        } else if self.is_captured() {
+             CAPTURED_SUFFIX
+         } else {
+             UNCAPTURED_SUFFIX
+@@ -216,7 +228,9 @@ impl Input {
+                 .focused_at
+                 .is_some_and(|t| timestamp.saturating_sub(t) < FOCUS_CLICK_NS);
+         let was_captured = self.is_captured();
+-        let forward = if was_captured {
++        let forward = if self.seamless {
++            !focusing
++        } else if was_captured {
+             true
+         } else {
+             self.capture.click_in_image(!focusing).forward
+@@ -406,6 +420,43 @@ mod tests {
+         }
+     }
+ 
++    /// Seamless input crosses the image edge after clicks and releases a drag outside it.
++    #[test]
++    fn seamless_clicks_and_drags_never_capture() {
++        let mut input = Input::seamless();
++        input.focus_gained(0);
++        let at_start = at((10.0, 10.0));
++        assert!(
++            !input
++                .button_down(BUTTON_LEFT, 1_000_000_000, &at_start)
++                .capture_changed
++        );
++        assert!(!input.is_captured());
++        assert_eq!(input.pointer_confinement(at_start.image), None);
++        input.moved(&at((150.0, 10.0)));
++        input.button_up(BUTTON_LEFT, &at((150.0, 10.0)));
++        input.moved(&at((10.0, 10.0)));
++        assert_eq!(
++            input.take(),
++            vec![
++                pointer(20, 20, BUTTON_LEFT),
++                pointer(199, 20, BUTTON_LEFT),
++                pointer(199, 20, 0),
++                pointer(20, 20, 0)
++            ]
++        );
++        input.key(0x04, true, false);
++        input.focus_lost();
++        assert_eq!(
++            input.take(),
++            vec![
++                ToHost::Key(KeyEvent::down(0x04)),
++                ToHost::Key(KeyEvent::up(0x04))
++            ]
++        );
++        assert!(!input.title_suffix().contains("capture"));
++    }
++
+     /// The click that focuses the window is not sent, but captures; the next one is sent
+     #[test]
+     fn the_click_that_focuses_the_window_is_not_sent() {
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index 4f8fc2ecec7194bd764d54d1544fafed23aa8ba3..24282265db2aacf9fce04711fd22e780dcc81eb3 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -187,7 +187,11 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) ->
+     Some(Opened {
+         sdl,
+         asked: size,
+-        input: Input(input::Input::new()),
++        input: Input(if crate::env::settings().seamless_input {
++            input::Input::seamless()
++        } else {
++            input::Input::new()
++        }),
+         state: State { display },
+     })
+ }

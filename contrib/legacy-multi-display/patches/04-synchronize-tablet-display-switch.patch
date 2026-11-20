@@ -1,0 +1,76 @@
+diff --git a/crates/reims-vgpu-window/src/native/linux/sdl.rs b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+index b82fd1615bde24b1ed04eadee68b3ea56a2325de..9a325b427370482e92f240b78fabac9335929e2d 100644
+--- a/crates/reims-vgpu-window/src/native/linux/sdl.rs
++++ b/crates/reims-vgpu-window/src/native/linux/sdl.rs
+@@ -111,6 +111,9 @@ impl Input {
+     /// ([`Window::pointer_sent`]).
+     pub(crate) fn flush(&mut self, window: &Window) {
+         window.send_each(self.0.take(), |callbacks, event| {
++            if let input::ToHost::Pointer { at, mode, .. } = event {
++                select_tablet_display(window.port(), at, mode);
++            }
+             if matches!(event, input::ToHost::Pointer { .. }) {
+                 window.pointer_sent();
+             }
+@@ -119,6 +122,61 @@ impl Input {
+     }
+ }
+ 
++// The guest's tablet coordinates are local to the screen containing its cursor.
++// Serialize the warp with SDL's input stream. The guest must finish switching
++// screens before QEMU sees coordinates relative to the new screen.
++fn select_tablet_display(port: u64, at: (u16, u16), mode: (u16, u16)) {
++    use std::cell::Cell;
++    use std::io::{Read, Write};
++    use std::os::unix::net::UnixStream;
++    use std::path::PathBuf;
++    use std::sync::OnceLock;
++    use std::time::Duration;
++
++    static SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
++    let Some(socket) = SOCKET
++        .get_or_init(|| std::env::var_os("REIMS_VGPU_TABLET_DISPLAY_SOCKET").map(PathBuf::from))
++    else {
++        return;
++    };
++    thread_local! {
++        static SELECTED: Cell<Option<u64>> = const { Cell::new(None) };
++        static LAST_FAILURE: Cell<Option<u64>> = const { Cell::new(None) };
++    }
++    // SAFETY: SDL is initialized on the calling UI thread.
++    let ticks = unsafe { SDL_GetTicks() };
++    if SELECTED.get() == Some(port)
++        || LAST_FAILURE
++            .get()
++            .is_some_and(|at| ticks.saturating_sub(at) < 250)
++    {
++        return;
++    }
++
++    let result = (|| -> std::io::Result<bool> {
++        let mut stream = UnixStream::connect(socket)?;
++        let timeout = Some(Duration::from_millis(70));
++        stream.set_read_timeout(timeout)?;
++        stream.set_write_timeout(timeout)?;
++        writeln!(
++            stream,
++            "{port} {:.6} {:.6}",
++            f64::from(at.0) / f64::from(mode.0.saturating_sub(1).max(1)),
++            f64::from(at.1) / f64::from(mode.1.saturating_sub(1).max(1)),
++        )?;
++        let mut ack = [0];
++        stream.read_exact(&mut ack)?;
++        Ok(ack[0] == b'1')
++    })();
++    if matches!(result, Ok(true)) {
++        SELECTED.set(Some(port));
++        LAST_FAILURE.set(None);
++    } else {
++        SELECTED.set(None);
++        LAST_FAILURE.set(Some(ticks));
++    }
++}
++
+ /// SDL's sizes on screen `display` (`crate::sdl::units`).
+ fn units_of(display: SDL_DisplayID) -> Units {
+     // SAFETY: SDL's video runs on this thread; the mode is SDL's, read at once.

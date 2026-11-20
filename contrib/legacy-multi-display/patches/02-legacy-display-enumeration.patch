@@ -1,0 +1,71 @@
+diff --git a/crates/reims-vgpu-core/src/device/mmio.rs b/crates/reims-vgpu-core/src/device/mmio.rs
+index 8f9d2de5a184babfa218dd3d788c18008942f4c9..c373d2f2d0936dc09fbe3084c32a447cc6eeb6d7 100644
+--- a/crates/reims-vgpu-core/src/device/mmio.rs
++++ b/crates/reims-vgpu-core/src/device/mmio.rs
+@@ -20,6 +20,14 @@
+ 
+ use std::sync::atomic::Ordering;
+ 
++// Opt-in for Intel drivers that enumerate ports before negotiating their ABI.
++// This changes only the display registers, never the negotiated command layouts.
++fn legacy_multiple_displays() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED
++        .get_or_init(|| std::env::var("REIMS_VGPU_LEGACY_MULTIPLE_DISPLAYS").as_deref() == Ok("1"))
++}
++
+ use crate::device::{DeviceCore, DeviceDeath};
+ use crate::guest::abi::features::features_for_version;
+ use crate::num::Truncate;
+@@ -251,10 +259,11 @@ impl<P: Platform> DeviceCore<P> {
+ 
+     /// The display port count the guest reads.
+     ///
+-    /// Below version 245 every read answers `count != 0`.
++    /// Below version 245 every read answers `count != 0`, unless the legacy
++    /// multi-display compatibility option is enabled.
+     pub fn guest_display_port_count(&self) -> u32 {
+         let mut count = self.display_port_count.load(Ordering::Relaxed);
+-        if !self.features.load().supports_multiple_displays {
++        if !self.features.load().supports_multiple_displays && !legacy_multiple_displays() {
+             count = u32::from(count != 0);
+             log::debug!("display port count reads {count}: the guest's version has one display");
+         }
+@@ -263,10 +272,10 @@ impl<P: Platform> DeviceCore<P> {
+ 
+     /// The display ports' connection types the guest reads.
+     ///
+-    /// Masked `& 3` below version 245.
++    /// Masked `& 3` below version 245, unless legacy multi-display is enabled.
+     pub fn guest_display_port_connection_types(&self) -> u32 {
+         let types = self.display_port_connection_types.load(Ordering::Relaxed);
+-        if self.features.load().supports_multiple_displays {
++        if self.features.load().supports_multiple_displays || legacy_multiple_displays() {
+             types
+         } else {
+             types & 3
+@@ -561,6 +570,24 @@ mod tests {
+         assert_eq!(r.device.mmio_read(0x1234), 0b1110);
+     }
+ 
++    // Run alone with REIMS_VGPU_LEGACY_MULTIPLE_DISPLAYS=1: the opt-in must
++    // expose all configured ports without changing the negotiated ABI.
++    #[test]
++    #[ignore = "requires REIMS_VGPU_LEGACY_MULTIPLE_DISPLAYS=1 in a separate process"]
++    fn legacy_display_ports_opt_in() {
++        let r = rig();
++        r.device.set_binary_version(6);
++        r.device.display_port_count.store(2, Ordering::SeqCst);
++        r.device
++            .display_port_connection_types
++            .store(0b1010, Ordering::SeqCst);
++        assert!(!r.device.features.load().supports_multiple_displays);
++        assert_eq!(r.device.mmio_read(0x122c), 2);
++        assert_eq!(r.device.mmio_read(0x1234), 0b1010);
++        r.device.display_port_count.store(0, Ordering::SeqCst);
++        assert_eq!(r.device.mmio_read(0x122c), 0);
++    }
++
+     // EFI: every EFI register is stored and read back without an EFI display.
+     #[test]
+     fn efi_registers_stored_without_efi_display() {
