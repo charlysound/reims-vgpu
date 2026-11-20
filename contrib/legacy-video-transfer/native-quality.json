@@ -1,0 +1,74 @@
+[
+  {
+    "case": "nv12",
+    "psnr_db": 57.136971,
+    "codec_name": "h264",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "nv12",
+    "psnr_db": 93.516541,
+    "codec_name": "hevc",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "cpu",
+    "psnr_db": 57.136971,
+    "codec_name": "h264",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "cpu",
+    "psnr_db": 93.516541,
+    "codec_name": "hevc",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "color",
+    "psnr_db": 41.238554,
+    "codec_name": "h264",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "color",
+    "psnr_db": 41.553419,
+    "codec_name": "hevc",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "aligned",
+    "psnr_db": 57.136971,
+    "codec_name": "h264",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "direct-color",
+    "psnr_db": 41.238554,
+    "codec_name": "h264",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  },
+  {
+    "case": "direct-color",
+    "psnr_db": 41.553419,
+    "codec_name": "hevc",
+    "width": 1920,
+    "height": 1080,
+    "nb_read_frames": "60"
+  }
+]

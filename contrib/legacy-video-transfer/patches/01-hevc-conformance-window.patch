@@ -1,0 +1,268 @@
+diff --git a/crates/reims-vgpu-video-codec/src/encode/encoder.rs b/crates/reims-vgpu-video-codec/src/encode/encoder.rs
+index 45a767772cf822437818d9c4b78c15ec8138d4a2..f20b73356badebaa10d83aaf38c5c66219fbdbca 100644
+--- a/crates/reims-vgpu-video-codec/src/encode/encoder.rs
++++ b/crates/reims-vgpu-video-codec/src/encode/encoder.rs
+@@ -1053,7 +1053,15 @@ impl<A: Accelerator> Encoder<A> {
+                         seen.push(Vec::new());
+                     }
+                     if let Some(set) = seen.get_mut(index) {
+-                        *set = unit.to_vec();
++                        *set = if codec == Codec::Hevc && index == 1 {
++                            hevc::crop_hardware_sps(
++                                unit,
++                                self.settings.width,
++                                self.settings.height,
++                            )?
++                        } else {
++                            unit.to_vec()
++                        };
+                     }
+                 }
+                 Role::Delimiter => {}
+@@ -1214,8 +1222,9 @@ pub mod tests {
+             }
+             let mut out = Vec::new();
+             for (n, unit) in p.parameter_sets.iter().enumerate() {
+-                match (&self.own_sps, n) {
+-                    (Some(sps), 0) => {
++                let sps_index = usize::from(p.hevc_slice.is_some());
++                match (&self.own_sps, n == sps_index) {
++                    (Some(sps), true) => {
+                         out.extend_from_slice(&nal::START_CODE);
+                         out.extend_from_slice(sps);
+                     }
+@@ -1536,6 +1545,35 @@ pub mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn hevc_hardware_record_keeps_its_fields_but_crops_to_the_requested_size()
++    -> Result<(), Unsupported> {
++        let settings = EncoderSettings::new(Profile::HevcMain, 1920, 1080);
++        let prototype = Encoder::new(Fake::default(), settings.clone(), &limits())?;
++        let Headers::Hevc { mut sps, .. } = prototype.headers else {
++            return Err(Unsupported("not HEVC".into()));
++        };
++        // A driver can round further than our minimum coding block and
++        // choose different coding tools. Its entire SPS must survive,
++        // except for the missing crop, in the record given to the caller.
++        sps.height = 1088;
++        sps.crop_bottom = 0;
++        sps.level_idc = 153;
++        sps.tools.sao = !sps.tools.sao;
++        let fake = Fake {
++            own_sps: Some(sps.sps_nal()?),
++            ..Fake::default()
++        };
++        let mut encoder = Encoder::new(fake, settings, &limits())?;
++        let first = samples(encoder.encode(&frame(0, false))?)?;
++        sps.crop_bottom = 8;
++        assert_eq!(encoder.record_units[1], sps.sps_nal()?);
++        let record = record_of(&encoder.headers, &encoder.record_units)
++            .ok_or_else(|| Unsupported("the repaired SPS did not read".into()))?;
++        assert_eq!(first[0].configuration.as_deref(), Some(&record[..]));
++        Ok(())
++    }
++
+     #[test]
+     fn hevc_predicts_from_the_last_picture_in_order() -> Result<(), Unsupported> {
+         let mut settings = EncoderSettings::new(Profile::HevcMain10, 100, 50);
+diff --git a/crates/reims-vgpu-video-codec/src/encode/hevc.rs b/crates/reims-vgpu-video-codec/src/encode/hevc.rs
+index c6848d76d5ee8cf7890689a147008cf3f9335503..30b438a626a8d5e29ada86971e19059b12e2a489 100644
+--- a/crates/reims-vgpu-video-codec/src/encode/hevc.rs
++++ b/crates/reims-vgpu-video-codec/src/encode/hevc.rs
+@@ -112,6 +112,106 @@ fn header(unit_type: u8) -> [u8; 2] {
+     [unit_type << 1, 1]
+ }
+ 
++/// Set the display size of a hardware SPS without changing its coding
++/// syntax. Mesa 25.2.8 on Navi21 returns a 1920x1088 SPS without a
++/// conformance window for a 1920x1080 encode, even with packed headers.
++/// The hardware's other fields must survive: its slices use those fields,
++/// which need not match the SPS originally submitted to the driver.
++pub(crate) fn crop_hardware_sps(
++    unit: &[u8],
++    width: u32,
++    height: u32,
++) -> Result<Vec<u8>, Unsupported> {
++    crop_sps(unit, width, height)
++        .map_err(|error| Unsupported(format!("the hardware's HEVC conformance window: {error:?}")))
++}
++
++fn crop_sps(unit: &[u8], width: u32, height: u32) -> Result<Vec<u8>, crate::hevc::Error> {
++    use crate::hevc::Error;
++    let mut r = BitReader::new(unit);
++    if r.bits(16)? != 0x4201 {
++        return Err(Error::Unsupported("SPS NAL header"));
++    }
++    r.skip(4)?;
++    if r.bits(3)? != 0 {
++        return Err(Error::Unsupported("sub-layers"));
++    }
++    r.skip(1 + 96)?; // temporal nesting and general profile_tier_level
++    r.ue_max(15, "sps_seq_parameter_set_id")?;
++    if r.ue()? != 1 {
++        return Err(Error::Unsupported("encoder chroma format"));
++    }
++    let coded_width = r.ue()?;
++    let coded_height = r.ue()?;
++    let start = r.position();
++    let mut offsets = [0; 4]; // left, right, top, bottom, in chroma samples
++    if r.bit()? {
++        for offset in &mut offsets {
++            *offset = r.ue()?;
++        }
++    }
++    let end = r.position();
++    let padding = |coded: u32, visible: u32, origin: u32| {
++        let total = coded.checked_sub(visible)?;
++        if visible == 0 || total % 2 != 0 {
++            return None;
++        }
++        (total / 2).checked_sub(origin)
++    };
++    let right = padding(coded_width, width, offsets[0])
++        .ok_or(Error::OutOfRange("horizontal conformance window"))?;
++    let bottom = padding(coded_height, height, offsets[2])
++        .ok_or(Error::OutOfRange("vertical conformance window"))?;
++
++    // Find rbsp_stop_one_bit, excluding only its byte-alignment zeros.
++    // Copy the opaque remainder up to that bit, then align it anew: the
++    // inserted Exp-Golomb fields can change the byte boundary.
++    let rbsp: Vec<u8> = crate::h264::bits::Unescape::new(unit).collect();
++    let last = *rbsp.last().ok_or(Error::Truncated)?;
++    if last == 0 {
++        return Err(Error::OutOfRange("SPS trailing bits"));
++    }
++    let alignment = usize::try_from(last.trailing_zeros()).map_err(|_| Error::Truncated)?;
++    let stop = rbsp
++        .len()
++        .checked_mul(8)
++        .and_then(|bits| bits.checked_sub(alignment))
++        .and_then(|bits| bits.checked_sub(1))
++        .ok_or(Error::Truncated)?;
++    if end >= stop {
++        return Err(Error::Truncated);
++    }
++    if offsets[1] == right && offsets[3] == bottom {
++        return Ok(unit.to_vec());
++    }
++    offsets[1] = right;
++    offsets[3] = bottom;
++    let mut w = BitWriter::new();
++    let mut source = BitReader::new(unit);
++    source.skip(16)?;
++    for _ in 16..start {
++        w.bit(source.bit()?);
++    }
++    let cropped = offsets.iter().any(|&v| v != 0);
++    w.flag(cropped);
++    if cropped {
++        for offset in offsets {
++            w.ue(offset);
++        }
++    }
++    for _ in start..end {
++        source.bit()?;
++    }
++    for _ in end..stop {
++        w.bit(source.bit()?);
++    }
++    w.trailing_bits();
++    Ok(nal::escape(
++        unit.get(..2).ok_or(Error::Truncated)?,
++        &w.into_bytes(),
++    ))
++}
++
+ impl Sps {
+     /// `general_profile_compatibility_flag[j]` as hvcC's 32 bits, flag 0
+     /// first: Main streams are Main 10 streams too (A.3.2, A.3.3).
+@@ -703,6 +803,87 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn hardware_crop_changes_only_the_conformance_window() -> Result<(), Unsupported> {
++        for profile in [Profile::HevcMain, Profile::HevcMain10] {
++            // Exercise both edges, padding below the minimum surface size,
++            // and Exp-Golomb lengths which move the trailing byte alignment.
++            for (coded, visible) in [
++                ((1920, 1088), (1920, 1080)),
++                ((1936, 1088), (1920, 1080)),
++                ((128, 128), (100, 50)),
++                ((128, 128), (126, 126)),
++                ((128, 128), (112, 64)),
++            ] {
++                let mut driver = sps();
++                driver.profile = profile;
++                (driver.width, driver.height) = coded;
++                driver.level_idc = 153;
++                driver.tools.amp = false;
++                driver.tools.sao = false;
++                driver.vui.sample_aspect_ratio = Some((1, 1));
++                // These VUI values require emulation prevention bytes.
++                driver.vui.timing = Some((1, 256));
++                let before = driver.sps_nal()?;
++                assert!(before.windows(3).any(|v| v == [0, 0, 3]));
++                driver.crop_right = coded.0 - visible.0;
++                driver.crop_bottom = coded.1 - visible.1;
++                let expected = driver.sps_nal()?;
++                let actual = crop_hardware_sps(&before, visible.0, visible.1)?;
++                // Byte equality covers every unrelated field, emulation
++                // prevention and the newly aligned rbsp_trailing_bits.
++                assert_eq!(actual, expected);
++                assert_eq!(crop_hardware_sps(&actual, visible.0, visible.1)?, actual);
++            }
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn hardware_crop_preserves_a_matching_window_and_updates_existing_padding()
++    -> Result<(), Unsupported> {
++        let mut driver = sps();
++        driver.height = 1088;
++        driver.crop_bottom = 8;
++        let correct = driver.sps_nal()?;
++        assert_eq!(crop_hardware_sps(&correct, 1920, 1080)?, correct);
++        let unpadded = sps().sps_nal()?;
++        assert_eq!(crop_hardware_sps(&unpadded, 1920, 1080)?, unpadded);
++        driver.crop_bottom = 4;
++        assert_eq!(crop_hardware_sps(&driver.sps_nal()?, 1920, 1080)?, correct);
++        driver.crop_bottom = 0;
++        let uncropped = driver.sps_nal()?;
++        assert_eq!(crop_hardware_sps(&correct, 1920, 1088)?, uncropped);
++        Ok(())
++    }
++
++    #[test]
++    fn hardware_crop_refuses_impossible_windows_and_truncated_syntax() -> Result<(), Unsupported> {
++        let unit = sps().sps_nal()?;
++        for (width, height) in [
++            (0, 1080),
++            (1920, 0),
++            (1922, 1080),
++            (1920, 1082),
++            (1919, 1080),
++        ] {
++            assert!(crop_hardware_sps(&unit, width, height).is_err());
++        }
++        for length in 0..20 {
++            assert!(crop_hardware_sps(&unit[..length], 1920, 1080).is_err());
++        }
++        let mut invalid = unit.clone();
++        invalid[0] = 0x44; // PPS, not SPS
++        assert!(crop_hardware_sps(&invalid, 1920, 1080).is_err());
++        invalid = unit.clone();
++        invalid[2] |= 2; // more than one sub-layer
++        assert!(crop_hardware_sps(&invalid, 1920, 1080).is_err());
++        invalid = unit;
++        invalid.push(0); // no rbsp_stop_one_bit in the final byte
++        assert!(crop_hardware_sps(&invalid, 1920, 1080).is_err());
++        Ok(())
++    }
++
+     #[test]
+     fn the_sps_reads_back_field_by_field() -> Result<(), crate::hevc::Error> {
+         let sps = sps();

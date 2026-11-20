@@ -1,0 +1,434 @@
+diff --git a/crates/reims-vgpu-core/src/resources.rs b/crates/reims-vgpu-core/src/resources.rs
+index 1405d252a15a8c76792d17f76152054e0a1cce61..33b7171a5c0b7fee417f48417171f555fc7efd9d 100644
+--- a/crates/reims-vgpu-core/src/resources.rs
++++ b/crates/reims-vgpu-core/src/resources.rs
+@@ -44,6 +44,7 @@
+ //! handles takes them in a fixed order in its `Drop`.
+ 
+ pub mod buffer;
++pub mod external_read;
+ pub mod heap;
+ pub mod host;
+ pub mod icb;
+diff --git a/crates/reims-vgpu-core/src/resources/external_read.rs b/crates/reims-vgpu-core/src/resources/external_read.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..feb06fb76d53e9d80288ec9616ea9a73dd5ccdfd
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/resources/external_read.rs
+@@ -0,0 +1,115 @@
++//! Synchronize GPU-backed IOSurfaces before a second device reads the same guest RAM.
++//!
++//! Legacy x86 GPU backings have private host textures. Video's mapper sees their guest
++//! pages instead. A completed Metal transfer need not include an IOSurface CPU lock, so
++//! reading those pages directly can return the preceding frame (or zero). Match the
++//! reader's original host RAM runs and write back only those live backings. Registration
++//! holds neither a resource nor its task alive; no callback runs under the registry lock.
++use std::ops::Range;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Weak};
++
++use crate::platform::Platform;
++use crate::resources::resource::{Resource, TaskRef};
++use crate::sync::Mutex;
++
++trait Reader: Send + Sync {
++    fn alive(&self) -> bool;
++    fn synchronize(&self, runs: &[Range<u64>]) -> Result<bool, String>;
++}
++
++static READERS: Mutex<Vec<Arc<dyn Reader>>> = Mutex::new(Vec::new());
++static REPORTED: AtomicBool = AtomicBool::new(false);
++
++struct Backing<P: Platform> {
++    resource: Weak<Resource<P>>,
++    task: TaskRef<P>,
++    /// Serializes readers through completion, including the early validity update.
++    reading: Mutex<()>,
++    runs: Arc<Mutex<Vec<Range<u64>>>>,
++}
++
++impl<P: Platform> Reader for Backing<P> {
++    fn alive(&self) -> bool {
++        self.resource.strong_count() > 0
++    }
++
++    fn synchronize(&self, runs: &[Range<u64>]) -> Result<bool, String> {
++        let _reading = self.reading.lock();
++        let Some(resource) = self.resource.upgrade() else {
++            return Ok(false);
++        };
++        if !resource.needs_sync() || !overlap(&self.runs.lock(), runs) {
++            return Ok(false);
++        }
++        let task = self
++            .task
++            .upgrade()
++            .ok_or("IOSurface backing task ended before read")?;
++        task.synchronize_backing_for_reader(&resource)?;
++        Ok(true)
++    }
++}
++
++/// Registers a backing with original host RAM runs. Empty runs mean unsupported.
++pub(crate) fn register<P: Platform>(
++    resource: &Arc<Resource<P>>,
++    task: TaskRef<P>,
++    runs: Arc<Mutex<Vec<Range<u64>>>>,
++) {
++    if runs.lock().is_empty() {
++        return;
++    }
++    let mut readers = READERS.lock();
++    readers.retain(|r| r.alive());
++    readers.push(Arc::new(Backing {
++        resource: Arc::downgrade(resource),
++        task,
++        reading: Mutex::new(()),
++        runs,
++    }));
++}
++
++/// Complete writeback before the caller lends these bytes to another device.
++/// The caller owns the surface and orders the producer before this read.
++pub fn synchronize(runs: &[Range<u64>]) -> Result<(), String> {
++    if runs.is_empty() {
++        return Ok(());
++    }
++    let live = {
++        let mut readers = READERS.lock();
++        readers.retain(|r| r.alive());
++        readers.clone()
++    };
++    for reader in live {
++        if reader.synchronize(runs)? && !REPORTED.swap(true, Ordering::Relaxed) {
++            log::info!("IOSurface GPU backing synchronized before external device read");
++        }
++    }
++    Ok(())
++}
++
++/// Runs on each side are sorted and merged.
++fn overlap(a: &[Range<u64>], b: &[Range<u64>]) -> bool {
++    let (mut i, mut j) = (0, 0);
++    while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
++        if x.start < y.end && y.start < x.end {
++            return true;
++        }
++        if x.end <= y.end { i += 1 } else { j += 1 }
++    }
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    #[allow(clippy::single_range_in_vec_init)] // Each element is a memory run, not its bytes.
++    fn only_shared_bytes_match() {
++        assert!(overlap(&[10..20, 30..40], &[0..11]));
++        assert!(overlap(&[10..20, 30..40], &[39..50]));
++        assert!(!overlap(&[10..20, 30..40], &[20..30]));
++        assert!(!overlap(&[], &[10..20]));
++    }
++}
+diff --git a/crates/reims-vgpu-core/src/resources/host.rs b/crates/reims-vgpu-core/src/resources/host.rs
+index 5fa534aef0554dfef8304c759c48ad0a6f92ba1d..5544872d232442845311018deb734e73fe427916 100644
+--- a/crates/reims-vgpu-core/src/resources/host.rs
++++ b/crates/reims-vgpu-core/src/resources/host.rs
+@@ -73,6 +73,22 @@ pub trait ResourceHost<P: Platform>: Send + Sync {
+         length: u64,
+     ) -> RaiseResult<P::Buffer>;
+ 
++    /// Original host RAM runs behind a local backing, for inter-device coherence.
++    /// An unsupported task returns no runs and is not registered.
++    fn backing_host_runs(
++        &self,
++        _hold: Hold<'_>,
++        _page: u32,
++        _length: u64,
++    ) -> RaiseResult<Vec<std::ops::Range<u64>>> {
++        Ok(Vec::new())
++    }
++
++    /// Complete a backing's GPU writeback before another device reads its RAM.
++    fn synchronize_backing_for_reader(&self, _backing: &Resource<P>) -> Result<(), String> {
++        Err("external backing synchronization unsupported".to_owned())
++    }
++
+     /// Prepares an IOSurface backing. `encoder` is `None` when Metal gave no encoder, which
+     /// nothing checks: the backing's validity writes still happen.
+     fn prepare_backing(
+diff --git a/crates/reims-vgpu-core/src/resources/texture/backing.rs b/crates/reims-vgpu-core/src/resources/texture/backing.rs
+index b470a3c3a9ce400811afff23ecae28b7041c4a28..7c3cda937b3271803a9808fb15a3145da3538716 100644
+--- a/crates/reims-vgpu-core/src/resources/texture/backing.rs
++++ b/crates/reims-vgpu-core/src/resources/texture/backing.rs
+@@ -110,6 +110,8 @@ impl BackingPlane {
+ pub struct BackingResource<P: Platform> {
+     /// The task, unretained.
+     task: TaskRef<P>,
++    /// Original RAM runs, cleared on discard and refreshed on rebinding.
++    external_runs: Arc<Mutex<Vec<std::ops::Range<u64>>>>,
+     /// The IOSurface (never checked for nil).
+     io_surface: Option<P::Surface>,
+     /// The validated planes.
+@@ -249,17 +251,23 @@ impl<P: Platform> BackingResource<P> {
+                 textures.push(texture);
+             }
+             drop(texture_descriptor);
+-            Ok(Some(Resource::new(ResourceKind::Backing(
+-                BackingResource {
+-                    task,
+-                    io_surface,
+-                    planes: own,
+-                    transfer_buffer: Mutex::new(Some(transfer_buffer)),
+-                    textures,
+-                    length,
+-                    page,
+-                },
+-            ))))
++            let runs = host
++                .as_ref()
++                .map_or(Ok(Vec::new()), |t| t.backing_host_runs(hold, page, length))?;
++            let external_runs = Arc::new(Mutex::new(runs));
++            let reader_task = task.clone();
++            let resource = Resource::new(ResourceKind::Backing(BackingResource {
++                task,
++                external_runs: external_runs.clone(),
++                io_surface,
++                planes: own,
++                transfer_buffer: Mutex::new(Some(transfer_buffer)),
++                textures,
++                length,
++                page,
++            }));
++            crate::resources::external_read::register(&resource, reader_task, external_runs);
++            Ok(Some(resource))
+         })
+     }
+ 
+@@ -282,6 +290,9 @@ impl<P: Platform> BackingResource<P> {
+         let Some(made) = made else {
+             return crate::resources::raise(crate::resources::RaiseKind::NoGuestBuffer);
+         };
++        if let Some(task) = self.task.upgrade() {
++            *self.external_runs.lock() = task.backing_host_runs(hold, self.page, self.length)?;
++        }
+         let copy = made.clone_ref();
+         // A plain store: a buffer a racing caller stored meanwhile is overwritten unreleased,
+         // its GPU VA kept taken.
+@@ -443,6 +454,7 @@ impl<P: Platform> ResourceClass<P> for BackingResource<P> {
+     fn discard(&self, this: &Resource<P>) -> RaiseResult<()> {
+         let _ = this;
+         // 63 on a backing only drops the guest pages.
++        self.external_runs.lock().clear();
+         let old = self.transfer_buffer.lock().take();
+         drop(old);
+         Ok(())
+@@ -528,6 +540,37 @@ mod tests {
+         })
+     }
+ 
++    /// Only matching live backings are synchronized; a failure never becomes a stale read.
++    #[test]
++    #[allow(clippy::single_range_in_vec_init)] // Each element is a memory run.
++    fn external_reads_match_live_backings_and_propagate_failure() {
++        let env = Env::new();
++        let r = new_in(
++            &env,
++            env.task(),
++            &desc(4096, 1, 1),
++            &[plane(0, 4, 4, 16, 4)],
++        )
++        .unwrap()
++        .unwrap();
++        r.set_is_host_valid(true);
++        r.set_is_guest_valid(false);
++        let address = 0x6170_0000_0000;
++        let runs = Arc::new(Mutex::new(vec![address..address + 4096]));
++        crate::resources::external_read::register(&r, env.task(), runs.clone());
++        assert!(
++            crate::resources::external_read::synchronize(&[address + 4096..address + 8192]).is_ok()
++        );
++        assert!(crate::resources::external_read::synchronize(&[address..address + 4096]).is_err());
++        runs.lock().clear();
++        assert!(crate::resources::external_read::synchronize(&[address..address + 4096]).is_ok());
++        *runs.lock() = vec![address..address + 4096];
++        let weak = Arc::downgrade(&r);
++        drop(r);
++        assert!(weak.upgrade().is_none());
++        assert!(crate::resources::external_read::synchronize(&[address..address + 4096]).is_ok());
++    }
++
+     fn backing(r: &Resource<P>) -> &BackingResource<P> {
+         match &r.kind {
+             ResourceKind::Backing(b) => b,
+@@ -999,6 +1042,7 @@ mod tests {
+         assert!(!r.state.host_valid());
+         // A backing whose task is gone.
+         let lone = BackingResource::<P> {
++            external_runs: Arc::default(),
+             task: {
+                 let other: Arc<dyn ResourceHost<P>> = env.rec.sibling();
+                 Arc::downgrade(&other)
+diff --git a/crates/reims-vgpu-core/src/tasks/local.rs b/crates/reims-vgpu-core/src/tasks/local.rs
+index 62c517f2f1a96a66da3d45df8c90479c4afd53ce..e7bc5a98e6ceb416fd5b4a80a394ad7c98154532 100644
+--- a/crates/reims-vgpu-core/src/tasks/local.rs
++++ b/crates/reims-vgpu-core/src/tasks/local.rs
+@@ -50,6 +50,7 @@
+ //! `tasks::raise`, and its handlers are the frames that take their `Err`.
+ 
+ mod exec;
++mod external_read;
+ mod info;
+ mod memory;
+ mod new;
+@@ -737,6 +738,20 @@ impl<P: Platform> ResourceHost<P> for LocalTask<P> {
+         self.on_platform(|| self.buffer_for_page(hold, page, length))
+     }
+ 
++    #[cfg(target_os = "linux")]
++    fn backing_host_runs(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Vec<std::ops::Range<u64>>> {
++        self.on_platform(|| self.external_backing_runs(hold, page, length))
++    }
++
++    fn synchronize_backing_for_reader(&self, backing: &Resource<P>) -> Result<(), String> {
++        self.on_platform(|| self.external_backing_read(backing))
++    }
++
+     fn prepare_backing(
+         &self,
+         hold: Hold<'_>,
+diff --git a/crates/reims-vgpu-core/src/tasks/local/external_read.rs b/crates/reims-vgpu-core/src/tasks/local/external_read.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e78560e4c732a000e1c84c4140fbd88a8dd871ee
+--- /dev/null
++++ b/crates/reims-vgpu-core/src/tasks/local/external_read.rs
+@@ -0,0 +1,110 @@
++//! Local task backing coherence at the video device's CPU read boundary.
++use super::LocalTask;
++#[cfg(target_os = "linux")]
++use super::{PAGE, page_address};
++#[cfg(target_os = "linux")]
++use crate::num::ToU64;
++use crate::platform::Platform;
++use crate::platform::blit::{BlitCmd, BlitEncoder};
++use crate::platform::command::{CommandBuffer, CommandQueue};
++use crate::platform::types::CommandBufferStatus;
++use crate::raise::{OnFault, RaiseResult};
++use crate::resources::resource::Resource;
++use crate::rt::{Held, Hold};
++#[cfg(target_os = "linux")]
++use std::ops::Range;
++
++impl<P: Platform> LocalTask<P> {
++    /// Resolve task pages to the original RAM addresses also held by the IOSurface mapper.
++    #[cfg(target_os = "linux")]
++    pub(super) fn external_backing_runs(
++        &self,
++        hold: Hold<'_>,
++        page: u32,
++        length: u64,
++    ) -> RaiseResult<Vec<Range<u64>>> {
++        let Some(map) = self.device.upgrade().and_then(|d| d.memory_map()) else {
++            return Ok(Vec::new());
++        };
++        let Some(walker) = &self.walker else {
++            return Ok(Vec::new());
++        };
++        let mut runs = Vec::new();
++        let mut missing = false;
++        walker.visit_pages_in_range(
++            hold,
++            OnFault::Return,
++            page_address(page),
++            length,
++            &mut |_, page, _| {
++                let ptr = map.virtual_address_for_physical(page_address(page), PAGE);
++                if ptr.is_null() {
++                    missing = true;
++                    return Ok(false);
++                }
++                let start = ptr.addr().to_u64();
++                runs.push(start..start + PAGE);
++                Ok(true)
++            },
++        )?;
++        if missing {
++            return Ok(Vec::new());
++        }
++        runs.sort_unstable_by_key(|r| r.start);
++        let mut merged: Vec<Range<u64>> = Vec::new();
++        for run in runs {
++            if let Some(last) = merged.last_mut()
++                && run.start <= last.end
++            {
++                last.end = last.end.max(run.end);
++            } else {
++                merged.push(run)
++            }
++        }
++        Ok(merged)
++    }
++
++    /// The producer has completed before the video request. Wait for this backing's blit
++    /// before exposing the bytes; a failed copy is an error, never a stale successful read.
++    pub(super) fn external_backing_read(&self, backing: &Resource<P>) -> Result<(), String> {
++        let held = Held::new();
++        let hold = Hold::of(&held);
++        let _lock = self.base.mutex.read();
++        if !backing.needs_sync() {
++            return Ok(());
++        }
++        let result = (|| -> RaiseResult<bool> {
++            let Some(queue) = self.base.paging_queue() else {
++                return Ok(false);
++            };
++            let Some(buffer) = queue.command_buffer(OnFault::Return)? else {
++                return Ok(false);
++            };
++            let Some(encoder) = buffer.blit_encoder(OnFault::Return)? else {
++                return Ok(false);
++            };
++            let mut copied = backing.synchronize_in_encoder(hold, Some(&encoder));
++            hold.cleanup_step(
++                &mut copied,
++                encoder.encode(OnFault::Return, BlitCmd::EndEncoding),
++            )?;
++            copied?;
++            buffer.commit(OnFault::Return)?;
++            buffer.wait_until_completed(OnFault::Return)?;
++            Ok(buffer.status() == CommandBufferStatus::COMPLETED)
++        })();
++        match result {
++            Ok(true) => Ok(()),
++            Ok(false) => {
++                backing.set_is_guest_valid(false);
++                Err("IOSurface GPU writeback did not complete".to_owned())
++            }
++            Err(error) => {
++                backing.set_is_guest_valid(false);
++                let reason = error.exception().to_owned();
++                hold.land(error);
++                Err(reason)
++            }
++        }
++    }
++}
+diff --git a/crates/reims-vgpu/src/video.rs b/crates/reims-vgpu/src/video.rs
+index 3bc1a97618e60d56a9332eae59bc1ab96fde52df..5dce549ce9e956b23a30b294d2ce474537e5d42d 100644
+--- a/crates/reims-vgpu/src/video.rs
++++ b/crates/reims-vgpu/src/video.rs
+@@ -235,6 +235,8 @@ impl<P: ApiPlatform> GuestSurface for MappedSurface<P> {
+     /// ([`ApiPlatform::lend_surface_bytes_for_reading`]): a surface the guest made read-only is
+     /// lent too. One they cannot be lent of is unreachable.
+     fn read(&self, read: &mut dyn FnMut(&[u8])) -> Result<(), SurfaceError> {
++        reims_vgpu_core::resources::external_read::synchronize(&self.pages)
++            .map_err(SurfaceError::Unreachable)?;
+         self.platform
+             .lend_surface_bytes_for_reading(&self.surface, read)
+             .map_err(|why| {

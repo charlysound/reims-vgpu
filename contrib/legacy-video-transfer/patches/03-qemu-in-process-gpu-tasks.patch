@@ -1,0 +1,30 @@
+diff --git a/hw/display/apple-gfx-pci.c b/hw/display/apple-gfx-pci.c
+index 34228552f36f40eac1019ac010586a2891570122..7a15c430e8cdf9a913520beed81d7e55e55371ee 100644
+--- a/hw/display/apple-gfx-pci.c
++++ b/hw/display/apple-gfx-pci.c
+@@ -39,6 +39,7 @@ struct AppleGFXPCIState {
+ 
+     AppleGFXState common;
+     bool efi_fb_bar;
++    bool process_isolation;
+     MemoryRegion efi_fb_bar_mr; /* BAR 2 */
+     MemoryRegion efi_fb; /* in BAR 2: an alias of the machine's RAM */
+ };
+@@ -160,7 +161,7 @@ static void apple_gfx_pci_realize(PCIDevice *dev, Error **errp)
+          * which apple_gfx_common_realize always gives.
+          */
+         .use_iosurface_mapper = true,
+-        .process_isolation = true,
++        .process_isolation = s->process_isolation,
+         .process_isolation_follows_guest = true,
+         .callbacks = &callbacks,
+     };
+@@ -219,6 +220,8 @@ static const Property apple_gfx_pci_properties[] = {
+     DEFINE_PROP_STRING("resolution", AppleGFXPCIState, common.resolution),
+     /* BAR 2, the EFI framebuffer's window for guests without a driver */
+     DEFINE_PROP_BOOL("efi-framebuffer-bar", AppleGFXPCIState, efi_fb_bar, true),
++    /* Legacy x86 GPU drivers share task 0 even when a video mapper is active. */
++    DEFINE_PROP_BOOL("process-isolation", AppleGFXPCIState, process_isolation, true),
+ };
+ 
+ static void apple_gfx_pci_class_init(ObjectClass *klass, const void *data)
