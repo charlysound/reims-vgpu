@@ -1,0 +1,14 @@
+{
+  "protocol": "X11",
+  "guest_key_after_hover": [
+    {
+      "port": 1,
+      "key": "j"
+    },
+    {
+      "port": 0,
+      "key": "k"
+    }
+  ],
+  "focus_in_linux_application_preserved": true
+}

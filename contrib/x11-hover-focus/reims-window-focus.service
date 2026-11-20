@@ -1,0 +1,11 @@
+[Unit]
+Description=Follow the pointer between Reims windows of the same VM
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/libexec/reims-window-focus.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
