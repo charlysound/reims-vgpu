@@ -1,0 +1,29 @@
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index d84140e2cc3b48932c5e7b4e662821c47cda495d..21be0f577b8bbaa098eebcc231b2cd38ffa22718 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -347,7 +347,23 @@ static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
+     /* QEMU's input layer does not clamp absolute axes. */
+     width = MAX(width, 1);
+     height = MAX(height, 1);
+-    qemu_input_queue_abs(d->con, INPUT_AXIS_X, MIN(x, width - 1), 0, width);
++    /*
++     * For an explicitly named outer display, the last image pixel also
++     * reaches the tablet's endpoint. macOS uses that endpoint for tiling
++     * against the right screen edge. Interior edges keep pixel coordinates.
++     */
++    x = MIN(x, width - 1);
++    if (x == width - 1 && width > 1) {
++        const char *edge_port = g_getenv("REIMS_VGPU_TABLET_RIGHT_EDGE_PORT");
++        char *end;
++
++        if (edge_port && g_ascii_isdigit(*edge_port) &&
++            g_ascii_strtoull(edge_port, &end, 10) ==
++                (uint64_t)(d - s->displays) && !*end) {
++            x = width;
++        }
++    }
++    qemu_input_queue_abs(d->con, INPUT_AXIS_X, x, 0, width);
+     qemu_input_queue_abs(d->con, INPUT_AXIS_Y, MIN(y, height - 1), 0, height);
+     qemu_input_update_buttons(d->con, button_map, s->input_buttons, buttons);
+     s->input_buttons = buttons;

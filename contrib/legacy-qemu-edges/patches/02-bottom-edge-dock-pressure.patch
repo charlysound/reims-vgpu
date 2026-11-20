@@ -1,0 +1,166 @@
+diff --git a/hw/display/apple-gfx.c b/hw/display/apple-gfx.c
+index 21be0f577b8bbaa098eebcc231b2cd38ffa22718..77552419215183209757e45435faefe68f8ff612 100644
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -331,6 +331,46 @@ static void set_cursor_glyph(AppleGFXDisplay *d,
+ /* The most wheel notches one scroll event sends the guest, on each axis. */
+ #define APPLE_GFX_WHEEL_MAX_NOTCHES 256
+ 
++/*
++ * A tablet stops reporting downward travel at the bottom pixel. A short
++ * stream from a relative USB mouse supplies the pressure macOS uses to move
++ * its Dock to this display. End the stream on any ordinary pointer movement
++ * off the edge, a button press, or after a bounded dwell.
++ */
++static void apple_gfx_dock_pulse(void *opaque)
++{
++    AppleGFXState *s = opaque;
++
++    if (s->dock_pulses && s->dock_display && !s->input_buttons) {
++        qemu_input_queue_rel(s->dock_display->con, INPUT_AXIS_Y, 18);
++        qemu_input_event_sync();
++        if (--s->dock_pulses) {
++            timer_mod(s->dock_timer,
++                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 80);
++        }
++    }
++}
++
++static void apple_gfx_dock_pressure(AppleGFXDisplay *d, uint16_t x, uint16_t y,
++                                    uint16_t width, uint16_t height,
++                                    uint32_t buttons)
++{
++    AppleGFXState *s = d->state;
++
++    if (!s->dock_timer) {
++        return;
++    }
++    if (buttons || height < 2 || y < height - 1 ||
++        x < 16 || width <= 16 || x >= width - 16) {
++        timer_del(s->dock_timer);
++        s->dock_display = NULL;
++    } else if (s->dock_display != d) {
++        s->dock_display = d;
++        s->dock_pulses = 32;
++        timer_mod(s->dock_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 80);
++    }
++}
++
+ static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
+                                     uint16_t y, uint16_t width,
+                                     uint16_t height, uint32_t buttons)
+@@ -368,6 +408,7 @@ static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
+     qemu_input_update_buttons(d->con, button_map, s->input_buttons, buttons);
+     s->input_buttons = buttons;
+     qemu_input_event_sync();
++    apple_gfx_dock_pressure(d, x, y, width, height, buttons);
+ }
+ 
+ /*
+@@ -1244,6 +1285,10 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
+     /* App Nap would slow the VM while no window of QEMU's is seen. */
+     apple_gfx_activity_begin();
+     s->holds_activity = true;
++    if (s->num_displays > 1 &&
++        g_strcmp0(g_getenv("REIMS_VGPU_DOCK_PRESSURE"), "1") == 0) {
++        s->dock_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, apple_gfx_dock_pulse, s);
++    }
+     return true;
+ 
+ fail:
+@@ -1264,6 +1309,10 @@ fail:
+ 
+ void apple_gfx_common_finalize(AppleGFXState *s)
+ {
++    if (s->dock_timer) {
++        timer_free(s->dock_timer);
++        s->dock_timer = NULL;
++    }
+     if (s->holds_activity) {
+         s->holds_activity = false;
+         apple_gfx_activity_end();
+diff --git a/hw/display/apple-gfx.h b/hw/display/apple-gfx.h
+index 928638a1bc740afd42883d225f6472cfc995788e..5cfcaeb7c528199d5dd4e970c74d3c282e92f169 100644
+--- a/hw/display/apple-gfx.h
++++ b/hw/display/apple-gfx.h
+@@ -93,6 +93,9 @@ struct AppleGFXState {
+ 
+     /* Mutable state (BQL protected) */
+     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
++    QEMUTimer *dock_timer;
++    AppleGFXDisplay *dock_display;
++    unsigned int dock_pulses;
+ };
+ 
+ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name);
+diff --git a/hw/input/hid.c b/hw/input/hid.c
+index 0f28827554e376c7c3eea3d48f96146ec9b44804..aae8c0b52b19d90aed698c58a0540e299e3efbd3 100644
+--- a/hw/input/hid.c
++++ b/hw/input/hid.c
+@@ -518,6 +518,21 @@ static const QemuInputHandler hid_mouse_handler = {
+     .sync  = hid_pointer_sync,
+ };
+ 
++static const QemuInputHandler hid_motion_only_handler = {
++    .name  = "QEMU HID Motion-only Mouse",
++    .mask  = INPUT_EVENT_MASK_REL,
++    .event = hid_pointer_event,
++    .sync  = hid_pointer_sync,
++};
++
++void hid_init_motion_only_mouse(HIDState *hs, HIDEventFunc event)
++{
++    hs->kind = HID_MOUSE;
++    hs->event = event;
++    hs->s = qemu_input_handler_register((DeviceState *)hs,
++                                        &hid_motion_only_handler);
++}
++
+ static const QemuInputHandler hid_tablet_handler = {
+     .name  = "QEMU HID Tablet",
+     .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
+index ae19d60203f086589c7798e4e553c05ab674bb8e..18bd733a6e53ca353dd4d029e068ae1d6002db33 100644
+--- a/hw/usb/dev-hid.c
++++ b/hw/usb/dev-hid.c
+@@ -43,6 +43,7 @@ struct USBHIDState {
+     uint32_t usb_version;
+     char *display;
+     uint32_t head;
++    bool motion_only;
+ };
+ 
+ #define TYPE_USB_HID "usb-hid"
+@@ -719,7 +720,11 @@ static void usb_hid_initfn(USBDevice *dev, int kind,
+     usb_desc_create_serial(dev);
+     usb_desc_init(dev);
+     us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+-    hid_init(&us->hid, kind, usb_hid_changed);
++    if (kind == HID_MOUSE && us->motion_only) {
++        hid_init_motion_only_mouse(&us->hid, usb_hid_changed);
++    } else {
++        hid_init(&us->hid, kind, usb_hid_changed);
++    }
+     if (us->display && us->hid.s) {
+         qemu_input_handler_bind(us->hid.s, us->display, us->head, NULL);
+     }
+@@ -819,6 +824,7 @@ static const TypeInfo usb_tablet_info = {
+ 
+ static const Property usb_mouse_properties[] = {
+         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
++        DEFINE_PROP_BOOL("motion-only", USBHIDState, motion_only, false),
+ };
+ 
+ static void usb_mouse_class_initfn(ObjectClass *klass, const void *data)
+diff --git a/include/hw/input/hid.h b/include/hw/input/hid.h
+index 6a9d7bf466ec5293f86f48fe4f3d00e34d5971f4..969a1486d6587ec8b737fd8878afeb11c5b791a2 100644
+--- a/include/hw/input/hid.h
++++ b/include/hw/input/hid.h
+@@ -49,6 +49,7 @@ struct HIDState {
+ };
+ 
+ void hid_init(HIDState *hs, int kind, HIDEventFunc event);
++void hid_init_motion_only_mouse(HIDState *hs, HIDEventFunc event);
+ void hid_reset(HIDState *hs);
+ void hid_free(HIDState *hs);
+ 
