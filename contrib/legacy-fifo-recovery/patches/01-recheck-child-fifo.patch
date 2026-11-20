@@ -1,0 +1,121 @@
+diff --git a/crates/reims-vgpu-core/src/fifo/ring.rs b/crates/reims-vgpu-core/src/fifo/ring.rs
+index 5331dc881359d5857469740104b11ae55aa44cd1..fe13e82e344c7480806b87f6cb5fa8a7a70e72e7 100644
+--- a/crates/reims-vgpu-core/src/fifo/ring.rs
++++ b/crates/reims-vgpu-core/src/fifo/ring.rs
+@@ -6,6 +6,13 @@
+ //! mapped at each start from the page list its node names; the guest writes `written` into the
+ //! node, and the FIFO publishes its read count there.
+ //!
++//! On Linux a child rechecks its node at least every 50 ms while waiting for bytes. A
++//! Sequoia KVM freeze left FIFO 4 asleep with written=0x1edd40 and read=0x1edc44;
++//! one ordinary poke resumed the display without changing any bytes or stamps (measured).
++//! The guest publishes in shared memory separately from its doorbell, so a missing or early
++//! notification must not strand those commands. This bounded wait neither completes an
++//! unfinished command nor bypasses its barriers; it only retries the same availability check.
++//!
+ //! A command's bytes are counted as they are copied and published only by [`Fifo::advance`],
+ //! after the whole command has been read; until then [`Fifo::rewind`] returns the cursor to the
+ //! last published point.
+@@ -22,6 +29,10 @@ use crate::guest::records::APV_PAGE_SIZE;
+ use crate::host::PhysRange;
+ use crate::num::{self, ToU64, ToUsize, Truncate};
+ use crate::platform::Platform;
++#[cfg(target_os = "linux")]
++use crate::platform::os::{Clock, Deadline};
++#[cfg(target_os = "linux")]
++use std::time::Duration;
+ 
+ /// The child node's fields (the guest's FIFO node).
+ // name is ours: the node's layout is the guest's; the roles follow what the FIFO does with each.
+@@ -209,10 +220,20 @@ impl<P: Platform> Fifo<P> {
+     }
+ 
+     /// One wait for ring bytes, under `lock`'s guard `g`: a poke, a root's `written` or a
+-    /// drain wakes it.
++    /// drain wakes it. Linux children also recheck shared-memory publication on a deadline.
+     fn wait_for_bytes(&self, g: &mut MutexGuard<'_, ()>) {
+         #[cfg(test)]
+         self.waiting_for_bytes.fetch_add(1, Ordering::SeqCst);
++        #[cfg(target_os = "linux")]
++        if matches!(&self.ring, Ring::Child(_)) {
++            let clock = self.platform.clock();
++            let deadline =
++                Deadline::Mono(clock.now_mono().saturating_add(Duration::from_millis(50)));
++            clock.wait_until(&self.bytes, g, deadline);
++        } else {
++            self.bytes.wait(g);
++        }
++        #[cfg(not(target_os = "linux"))]
+         self.bytes.wait(g);
+         #[cfg(test)]
+         self.waiting_for_bytes.fetch_sub(1, Ordering::SeqCst);
+diff --git a/crates/reims-vgpu-core/src/fifo/tests.rs b/crates/reims-vgpu-core/src/fifo/tests.rs
+index ca1666aa83009a2a759ce9cc226ffb7c1e6d73f9..6cc5388f8d6a867d5bfa58e0d460c2ccb8f52c12 100644
+--- a/crates/reims-vgpu-core/src/fifo/tests.rs
++++ b/crates/reims-vgpu-core/src/fifo/tests.rs
+@@ -466,6 +466,50 @@ fn mapped_child(kit: &Kit, pages: u32) -> (Arc<Fifo<P>>, ChildMem) {
+ mod child_read_bytes {
+     use super::*;
+ 
++    /// A guest can publish after a doorbell was handled. Recheck the node without another poke.
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn published_bytes_progress_without_another_doorbell() {
++        use std::sync::mpsc;
++        use std::time::Duration;
++
++        for initially_written in [0, 2] {
++            let kit = Kit::new();
++            let (f, m) = mapped_child(&kit, 1);
++            m.ring.write(0, &[1, 2, 3, 4]);
++            m.node.write_u32(0, initially_written);
++            let reader = f.clone();
++            let (tx, rx) = mpsc::channel();
++            let thread = std::thread::spawn(move || {
++                let mut bytes = [0u8; 4];
++                let read = reader.read_bytes(&mut bytes);
++                tx.send((read, bytes)).unwrap();
++            });
++            assert!(wait_for(|| f.waiting_for_bytes.load(Ordering::SeqCst) == 1));
++            // The lock ensures the reader has entered its condition wait. Publish only;
++            // no interrupt, poke, or fabricated completion is supplied by the test.
++            {
++                let _guard = f.lock.lock();
++                m.node_ptr().store_seqcst_u32(0, 4, DeathKind::NodeNull);
++            }
++            assert!(rx.recv_timeout(Duration::from_millis(10)).is_err());
++            kit.platform
++                .virtual_clock()
++                .advance(Duration::from_millis(50));
++            let answer = rx.recv_timeout(Duration::from_secs(1));
++            // Join even on the old implementation, so the regression fails without hanging.
++            f.quiesce();
++            f.poke();
++            thread.join().unwrap();
++            assert_eq!(answer.unwrap(), (true, [1, 2, 3, 4]));
++            let Ring::Child(child) = &f.ring else {
++                panic!()
++            };
++            assert_eq!(child.read_count.load(Ordering::Relaxed), 4);
++            assert_eq!(m.node.read_u32(4), Some(0)); // publication still belongs to advance
++        }
++    }
++
+     /// Counts locally; waits for the rest of a partial command
+     #[test]
+     fn waits_for_the_rest() {
+diff --git a/crates/reims-vgpu-core/src/fifo/thread.rs b/crates/reims-vgpu-core/src/fifo/thread.rs
+index 1f521dbe4175b52c79144415cbfc0924bec32441..487df6c8aa452bc383ab2a6e619b92b8023061ec 100644
+--- a/crates/reims-vgpu-core/src/fifo/thread.rs
++++ b/crates/reims-vgpu-core/src/fifo/thread.rs
+@@ -78,8 +78,8 @@ impl<P: Platform> Fifo<P> {
+         self.quiesce();
+     }
+ 
+-    /// Quiesces the FIFO and its stamps. It wakes no one: a thread waiting for ring bytes waits
+-    /// on until a poke or a write.
++    /// Quiesces the FIFO and its stamps without notifying the byte wait. Linux children
++    /// observe this at their next bounded recheck; other readers need a poke or a write.
+     pub fn quiesce(&self) {
+         let _g = self.lock.lock();
+         self.quiesced.store(true, Ordering::SeqCst);
